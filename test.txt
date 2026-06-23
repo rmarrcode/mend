@@ -1,0 +1,280 @@
+
+========================================================================================================================
+PROBLEM METADATA
+========================================================================================================================
+instance_id: sympy__sympy-20590
+repo: sympy/sympy
+base_commit: deadbeef
+problem_statement: Fix Matrix.inv() to raise MatrixError for singular matrices instead of IndexError
+hints_text: Check sympy/matrices/dense.py DenseMatrix.inv() method around line 150
+issue_url: https://github.com/sympy/sympy/issues/20590
+pr_url: https://github.com/sympy/sympy/pull/20620
+
+========================================================================================================================
+TESTS TO FIX
+========================================================================================================================
+sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_singular_matrix
+sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_singular_error_message
+
+========================================================================================================================
+TESTS TO KEEP PASSING
+========================================================================================================================
+sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_invertible_matrix
+sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_identity_matrix
+
+========================================================================================================================
+FILE: sympy/matrices/tests/test_matrices.py
+========================================================================================================================
+import pytest
+from sympy import Matrix, MatrixError, eye, symbols, S
+
+
+class TestMatrixInverse:
+
+    def test_singular_matrix(self):
+        """Test that singular matrix (det=0) raises MatrixError"""
+        # A singular matrix has determinant = 0
+        M = Matrix([[1, 2], [2, 4]])
+
+        # det([[1,2],[2,4]]) = 1*4 - 2*2 = 0 (singular)
+        assert M.det() == 0
+
+        # Should raise MatrixError with message about singularity
+        with pytest.raises(MatrixError) as exc_info:
+            M.inv()
+
+        error_msg = str(exc_info.value).lower()
+        assert "singular" in error_msg or "not invertible" in error_msg
+
+    def test_singular_error_message(self):
+        """Test that singularity error has clear message"""
+        M = Matrix([[0, 0], [0, 0]])
+
+        try:
+            result = M.inv()
+            # If we get here, test fails - should have raised error
+            raise AssertionError("Expected MatrixError for singular matrix but got result: " + str(result))
+        except MatrixError as e:
+            # Good - got expected error
+            error_msg = str(e).lower()
+            assert "singular" in error_msg or "not invertible" in error_msg
+        except IndexError as e:
+            # Bad - got IndexError instead of MatrixError
+            raise AssertionError(f"Got IndexError instead of MatrixError: {e}")
+
+    def test_invertible_matrix(self):
+        """Test that invertible matrices work correctly"""
+        M = Matrix([[1, 2], [3, 4]])
+
+        # det([[1,2],[3,4]]) = 1*4 - 3*2 = -2 (not singular)
+        assert M.det() != 0
+
+        # Should return inverse without error
+        result = M.inv()
+
+        # Inverse of [[1,2],[3,4]] should be [[-2, 1], [1.5, -0.5]]
+        assert result is not None
+
+        # Verify: M * M.inv() = I
+        identity = M * result
+        assert identity == eye(2)
+
+    def test_identity_matrix(self):
+        """Test that identity matrix inv is itself"""
+        M = eye(3)
+        result = M.inv()
+        assert result == M
+
+
+========================================================================================================================
+FILE: sympy/matrices/dense.py (BUGGY VERSION)
+========================================================================================================================
+from sympy.core.sympify import _sympify
+from sympy.matrices.common import MatrixError
+
+
+class DenseMatrix:
+    """Dense matrix class with inv() method"""
+
+    def inv(self, method=None):
+        """Return the inverse of the matrix.
+
+        Parameters
+        ----------
+        method : string, optional
+            Method to use for computing inverse.
+
+        Returns
+        -------
+        DenseMatrix
+            The inverse matrix
+
+        Raises
+        ------
+        MatrixError
+            If the matrix is not square or is singular
+        """
+        if self.shape[0] != self.shape[1]:
+            raise MatrixError("A non-square matrix cannot be inverted.")
+
+        # BUG IS HERE: Missing check for singular matrix!
+        # Code should check if determinant is 0 and raise MatrixError
+        # but instead it just continues and fails with unclear IndexError
+
+        det = self.det()
+
+        if det == 0:
+            # THIS IS WHERE THE BUG IS
+            # The code has a TODO comment but no actual error handling
+            # TODO: Should raise MatrixError here
+            pass
+
+        # Without proper singular check above, code continues
+        # and tries to compute inverse of singular matrix
+        # This causes IndexError or incorrect computation
+
+        adjugate = self._adjugate_matrix()
+
+        # If matrix is singular (det=0), division fails or returns bad result
+        result = adjugate * (1/det)
+
+        return result
+
+    def det(self):
+        """Return the determinant of the matrix"""
+        # ... determinant computation code
+        return 0  # placeholder
+
+    def _adjugate_matrix(self):
+        """Compute the adjugate (cofactor transpose) matrix"""
+        # For singular matrices this can fail
+        # ... adjugate computation code
+        return self  # placeholder
+
+
+========================================================================================================================
+FILE: sympy/matrices/__init__.py (what gets imported)
+========================================================================================================================
+"""Matrix module - exports Matrix and related classes"""
+
+from sympy.matrices.common import MatrixError
+from sympy.matrices.dense import DenseMatrix
+
+
+class Matrix(DenseMatrix):
+    """Matrix class that inherits from DenseMatrix"""
+    pass
+
+
+def eye(n):
+    """Create an n x n identity matrix"""
+    return Matrix([[1 if i == j else 0 for j in range(n)] for i in range(n)])
+
+
+========================================================================================================================
+FILE: sympy/matrices/common.py
+========================================================================================================================
+"""Common matrix definitions and exceptions"""
+
+
+class MatrixError(Exception):
+    """Exception raised for matrix-related errors"""
+    pass
+
+
+========================================================================================================================
+ACTUAL TEST FAILURE OUTPUT
+========================================================================================================================
+$ pytest sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_singular_matrix -xvs
+
+test_matrices.py::TestMatrixInverse::test_singular_matrix FAILED
+
+__________________________ TestMatrixInverse::test_singular_matrix __________________________
+
+    def test_singular_matrix(self):
+        """Test that singular matrix (det=0) raises MatrixError"""
+        # A singular matrix has determinant = 0
+        M = Matrix([[1, 2], [2, 4]])
+
+        # det([[1,2],[2,4]]) = 1*4 - 2*2 = 0 (singular)
+        assert M.det() == 0
+
+        # Should raise MatrixError with message about singularity
+>       with pytest.raises(MatrixError) as exc_info:
+>           M.inv()
+E       IndexError: index out of range
+
+sympy/matrices/tests/test_matrices.py:18
+
+During handling of the above exception, another exception occurred:
+
+>       with pytest.raises(MatrixError) as exc_info:
+>           M.inv()
+
+sympy/matrices/dense.py:156 in inv
+    result = adjugate * (1/det)
+sympy/matrices/dense.py:155 in inv
+    adjugate = self._adjugate_matrix()
+
+IndexError: index out of range
+
+The above exception was the direct cause of a failure in a fixture:
+pytest.raises.ExceptionInfo
+
+E       DID NOT RAISE MatrixError
+
+
+$ pytest sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_singular_error_message -xvs
+
+test_matrices.py::TestMatrixInverse::test_singular_error_message FAILED
+
+    def test_singular_error_message(self):
+        """Test that singularity error has clear message"""
+        M = Matrix([[0, 0], [0, 0]])
+
+        try:
+            result = M.inv()
+>           raise AssertionError("Expected MatrixError for singular matrix but got result: " + str(result))
+E           IndexError: index 0 is out of bounds for axis 0 with size 0
+
+sympy/matrices/tests/test_matrices.py:23
+
+sympy/matrices/dense.py:156 in inv
+    result = adjugate * (1/det)
+
+FAILED sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_singular_matrix
+FAILED sympy/matrices/tests/test_matrices.py::TestMatrixInverse::test_singular_error_message
+
+======================== 2 failed, 2 passed in 0.47s ========================
+
+
+========================================================================================================================
+WHAT AN LLM CAN DO WITH CONTEXT
+========================================================================================================================
+
+1. LLM reads test file and sees:
+   - test_singular_matrix expects MatrixError when det=0
+   - test_singular_error_message expects MatrixError, not IndexError
+   - Tests show exact behavior required
+
+2. LLM reads source file and sees:
+   - det() is computed at line 152
+   - Check if det == 0 exists but is empty (pass statement)
+   - This is where MatrixError should be raised
+   - Currently code continues and gets IndexError
+
+3. LLM reads error output and sees:
+   - IndexError on line 156 in _adjugate_matrix()
+   - Happens because singular matrix passed to adjugate
+   - Root cause: missing MatrixError raise after det==0 check
+
+4. FIX:
+   Find the empty if block after det == 0 check
+   Replace 'pass' with: raise MatrixError("Matrix is singular...")
+
+5. LLM can:
+   - context.read_file("sympy/matrices/dense.py") → see exact code
+   - context.write_file() → make the fix
+   - context.run_failing_tests() → verify it works
+   - See exact line numbers and error traces
+

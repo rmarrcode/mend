@@ -1,0 +1,302 @@
+Companies doing this (or adjacent versions of it)
+=======================================================
+
+The honest summary first: nobody is commercially shipping your exact pipeline
+(symbolic generalization of failing inputs → spec modification → constraint-driven
+patch synthesis). The closest commercial activity clusters into three groups:
+
+
+1. Automated Remediation Startups (LLM-heavy, light symbolic)
+--------------------------------------------------------------
+
+A purpose-built automated code remediation category emerged in 2023–2024 with
+Pixee, Mobb, and Corgea — tools that take vulnerability findings from any scanner
+and produce production-ready code fixes that developers merge.
+
+- Corgea (YC S23) integrates with SAST tools like Snyk or Semgrep, generates AI
+  fixes, and opens pull requests with explanations.
+- Pixee was founded by Arshan Dabirsiaghi, co-founder of Contrast Security.
+  Notably, Pixee's lineage includes deterministic codemods (their open-source
+  codemodder framework) — that's the most "symbolic" of the bunch, since
+  pattern-based AST rewrites for known vulnerability classes are sound by
+  construction.
+- Mobb similarly does fix generation from scanner output, though it's been
+  characterized as AI-only methodology without deterministic codemods.
+
+These are neurosymbolic only in the weak sense: symbolic detection (static
+analysis) + neural fix generation. There's no constraint solving in the repair step.
+
+
+2. Big-lab Internal Systems — the Closest in Spirit
+----------------------------------------------------
+
+- Google DeepMind's CodeMender (announced late 2025) is probably the nearest real
+  deployment: it couples an LLM with program analysis, fuzzing, differential
+  testing, and SMT solvers, and uses an LLM-judge plus analysis-based validation
+  loop before proposing upstream patches to open-source projects.
+- Meta's SapFix/Getafix (deployed internally, older) combined Infer's static
+  analysis with template/mutation-based patching and automatic test validation.
+- Amazon's automated-reasoning group ships solver-backed code reasoning in
+  CodeGuru and has the Kani/Cedar verification stack, though not packaged as
+  "repair."
+- Microsoft Research's PROSE group did LaMirage, a neurosymbolic last-mile repair
+  engine generator for low-code formula languages, using symbolic techniques for
+  candidate enumeration and neural ranking — that shipped into Excel/PowerApps
+  experiences.
+
+
+3. Formal-Methods Companies That Could Pivot into Repair
+---------------------------------------------------------
+
+Certora (smart contract verification — they already do mutation testing against
+specs), Imandra (neurosymbolic reasoning-as-a-service over a formal logic),
+Galois, Trail of Bits, Runtime Verification, Moderne (deterministic large-scale
+rewrites via OpenRewrite), Grit (AI + GritQL structural rewrites).
+
+None sells "verified bug repair" as a product today — the gap between the academic
+SemFix/Angelix line and any commercial offering has persisted for a decade, mostly
+because of the oracle problem (more below) and because LLM-only repair got "good
+enough" for the security-fix niche. If you're evaluating this as a startup thesis,
+the absence is the interesting datum.
+
+
+Academic Neurosymbolic Repair (Architecture Reference)
+------------------------------------------------------
+
+- Seq2Parse: symbolic error-correcting parsers can synthesize repairs in principle
+  but are overwhelmed by irrelevant rules; a neural model pinpoints which rules are
+  relevant — that division of labor (neural = relevance filter, symbolic = sound
+  search) is exactly the design philosophy you want.
+- FlakyDoctor: combines LLM generalizability with program-analysis soundness; the
+  non-LLM components contribute 12–31% of overall performance — a useful empirical
+  anchor for how much the symbolic side buys you today.
+
+
+What a Path and a Path Condition Are
+=====================================
+
+A path is one specific route of control flow through a program: a particular
+resolution of every branch (if/else, loop iteration count, exception vs. no
+exception) from entry to exit.
+
+A path condition is the logical formula over the inputs that is necessary and
+sufficient for execution to follow that path. You get it by executing the program
+symbolically: instead of concrete values, variables hold symbolic expressions, and
+every time you hit a branch you record the branch's condition (or its negation) as
+a conjunct.
+
+    def f(x, y):
+        if x > 0:          # branch A
+            z = y + 1
+        else:
+            z = y - 1
+        if z == 10:        # branch B
+            return 0       # path P1: A-true, B-true
+        return z           # paths P2, P3, ...
+
+Path P1 (both branches true) has path condition x > 0 ∧ y + 1 == 10, i.e.,
+x > 0 ∧ y == 9, and on that path the symbolic output is 0. Every input satisfying
+that formula takes exactly that path.
+
+The set of all paths partitions the input space, and (for loop-free code) the
+disjunction of (path condition ∧ output expression) pairs is the complete
+functional semantics — which is why a "complete spec" is really a transpilation of
+the program.
+
+Concolic execution (concrete + symbolic) is the practical variant: you run a real
+failing test, shadow it symbolically, and read off the path condition of the path
+that test actually took. CrossHair does this for Python on top of Z3.
+
+
+Making φ_bug General Enough to Cover All Failing Inputs
+========================================================
+
+The path condition of one failing test gives you everyone who takes that path —
+but the bug may be reachable along several paths, and conversely not every input
+on the failing path necessarily produces a wrong answer. So you generalize in two
+directions, with a refinement loop:
+
+Widen (find more failing regions):
+
+(a) Take the path conditions of all failing tests and disjoin them.
+
+(b) Hunt for failing paths you don't have tests for: negate φ_bug, ask the
+    symbolic executor to enumerate other paths, and for each path check with the
+    solver whether an input on it violates the expected behavior — this requires
+    some oracle on those inputs (an assertion, a reference implementation, a
+    metamorphic property), which is the fundamental constraint: you can only
+    generalize φ_bug as far as your oracle reaches. Fuzzing (Hypothesis with a
+    property, or differential fuzzing against a reference) is the cheap empirical
+    widener.
+
+(c) If the bug is a wrong expression rather than a wrong branch, the cleaner
+    formalization is in terms of the defect, not the input: φ_bug = "inputs whose
+    execution reaches location L with state satisfying ψ," computed as the weakest
+    precondition of reaching L under ψ. That covers all paths into the buggy state
+    at once and is usually the most faithful generalization.
+
+Narrow (exclude passing inputs):
+
+Check φ_bug(t) is false for every passing test; better, ask the solver for a model
+of φ_bug ∧ φ_pass-region and if one exists, you've overgeneralized — run that input
+concretely, observe pass/fail, and add it as a labeled example to refine the
+predicate. This is exactly a CEGAR-style loop (counterexample-guided abstraction
+refinement), and it converges to a φ_bug that is consistent with everything you can
+observe. For learned predicates (decision trees over input features, Alhazen-style),
+the same loop applies with the solver replaced by the fuzzer.
+
+The fixed point you can actually certify: φ_bug covers all failing tests, excludes
+all passing tests, and the solver/fuzzer can find no labeled counterexample to
+either inclusion. That's the strongest statement available without a complete oracle.
+
+
+SBFL (Spectrum-Based Fault Localization)
+=========================================
+
+Run the test suite with per-statement (or per-branch) coverage instrumentation.
+For each program element e, count:
+
+    ef = failing tests that execute e
+    ep = passing tests that execute e
+    nf = failing tests that don't
+    np = passing tests that don't
+
+Rank elements by a suspiciousness formula — Ochiai is the standard:
+
+    ef / sqrt((ef + nf) · (ef + ep))
+
+Intuition: a statement executed by every failing test and few passing tests is
+probably implicated. It's cheap (just coverage), purely statistical, and gives you
+a ranked list of candidate fault locations to cut holes at.
+
+In Python: coverage.py per-test contexts, or pytest plugins; it's ~50 lines to
+implement yourself. Its weakness is coarse granularity and ties; intersecting the
+SBFL ranking with the failing tests' symbolic path conditions (statements on failing
+paths whose removal/alteration changes the path) sharpens it considerably.
+
+
+Angelic Values
+===============
+
+An angelic value answers the counterfactual: "if the expression at suspect location
+L had evaluated to value v on this failing test, would the test have passed?"
+
+You replace the expression at L with a fresh symbolic variable α, execute the
+failing test symbolically with everything else concrete, and ask the solver: find α
+such that the program's output equals the expected output.
+
+Concretely, if the bug is `if x >= 0:` and the failing test is x = 0 expecting
+output -1, the solver discovers that the test passes iff the condition evaluates to
+False when x = 0 — so the angelic value at L for that test is False.
+
+Do this for every failing test (and record the actual values at L for passing tests,
+which must be preserved). The result is a table of point constraints:
+
+    { (state₁ → α=False), (state₂ → α=False), (state₃ → α=True), ... }
+
+The repair problem then collapses to: synthesize an expression over the variables in
+scope at L that matches this table — a small SyGuS/enumerative-search problem,
+solvable without any LLM for arithmetic/boolean expressions.
+
+This is the core of Angelix, and it's the move that eliminates the ??? in your
+spec-modification step: instead of needing to know the correct global spec on the
+bug region, you only need the correct local value per witnessed input, which the
+tests give you for free.
+
+(Multi-line/multi-location bugs: introduce one angelic variable per suspect location
+and solve jointly; cost grows fast, which is Angelix's known scalability limit.)
+
+
+How Much "Proof of Correctness" Can You Get?
+=============================================
+
+There's a strict hierarchy:
+
+1. Passes all tests. Trivially checkable; chronically insufficient (test-overfitting).
+
+2. Satisfies the angelic/point constraints exactly. Solver-certified, but it's a
+   proof about finitely many inputs.
+
+3. Relational correctness, bounded. "The patched program agrees with the original
+   on ¬φ_bug" — check by symbolically executing old-vs-new composed and asking the
+   solver for any input in ¬φ_bug where outputs differ, up to a loop-unrolling
+   bound. This is a real proof (within the bound) that you introduced no regression,
+   and it requires no spec at all — the old program is the spec on the unaffected
+   region. This is the highest-value guarantee in the whole design and is fully
+   solver-mechanizable.
+
+4. Relational correctness, unbounded. Same statement without the bound — needs loop
+   invariants or equivalence-checking tricks (e.g., the loops are syntactically
+   identical outside the patch, so equivalence reduces to the patched fragment).
+   Often achievable precisely because repairs are small.
+
+5. Full functional correctness against an intended spec. Only possible to the extent
+   an intended spec exists in machine-checkable form. On the bug region, your only
+   oracle is the failing tests plus whatever properties you can extract from the
+   natural-language description. A "proof" here is always relative: "correct with
+   respect to spec S." This is the oracle problem and no amount of solver machinery
+   removes it — it's information-theoretic, not computational.
+
+The maximal honest guarantee your pipeline can emit is: "provably equivalent to the
+original everywhere outside φ_bug (rung 3/4), provably consistent with all known
+correct behaviors inside φ_bug (rung 2), and consistent with mined/stated properties
+P₁…Pₖ (partial rung 5)." That's a genuinely strong certificate — much stronger than
+anything the commercial tools above produce — but it is not "the bug is fixed" in an
+absolute sense, because "the bug" is defined by an intention that lives outside the
+formal system.
+
+
+Your Solver-Heavy, Weak-LLM Design Goal
+=========================================
+
+What you're describing — "if X happens then I fixed the bug, just keep iterating
+until X happens" — has a name: it's the CEGIS loop with a decidable acceptance
+condition.
+
+Acceptance condition X (all solver-checkable, no judgment calls):
+
+1. All point constraints (angelic values + passing-test values) satisfied — solver check.
+2. No counterexample to relational equivalence on ¬φ_bug — solver check (bounded).
+3. No counterexample from the property set / fuzzer within budget — mechanical.
+
+The loop: propose candidate → check X → if a check fails, the checker returns a
+counterexample input, which you add to the constraint table → propose again.
+
+Two properties make this well-behaved:
+- Every iteration the constraint set grows monotonically (you never revisit a
+  refuted candidate — the new constraint excludes it).
+- Acceptance is binary and machine-decided, so a weak proposer suffices.
+
+The proposer's quality affects only speed, never soundness. This is the formal
+version of "I don't need a powerful LLM."
+
+How far you can push the LLM out entirely:
+
+- Single-expression repairs over arithmetic/boolean/comparison operators: fully
+  solver-only. Enumerative or SyGuS-style synthesis against the angelic table is
+  decidable and fast for small grammars. DirectFix even phrases it as one
+  partial-MaxSMT query — minimize syntactic distance from the original expression
+  subject to the constraints — giving you a principled "smallest fix" objective
+  with no neural component at all.
+
+- Template/sketch repairs (off-by-one, operator flip, missing null-check, swapped
+  arguments, boundary condition): a fixed library of parametric mutations,
+  parameters solved by SMT. Covers a large fraction of real single-hunk bugs; this
+  is essentially what made Prophet/SemFix-era tools work.
+
+- Where you can't avoid some neural help: choosing which location/sketch when SBFL
+  is ambiguous, repairs needing a new statement or API call not in your grammar, and
+  string/heap-heavy semantics where SMT theories get expensive. Even there, the LLM
+  can be small and dumb — it's only proposing within a loop whose acceptance is
+  symbolic. A reasonable progression: enumerative synthesis first, sketch library
+  second, LLM proposer only as the fallback tier.
+
+The one place "keep iterating until X" can betray you: X is satisfiable by a wrong
+patch whenever your constraints underdetermine the intended behavior (few failing
+tests, weak properties). The mitigation is also symbolic — before accepting, have
+the solver search for two semantically different candidates both satisfying X; if it
+finds them, your spec is too loose, and the distinguishing input between them is
+precisely the question to escalate (to a fuzzer with a reference oracle, or to a
+human).
+
+That "distinguishing-input" trick, borrowed from oracle-guided inductive synthesis
